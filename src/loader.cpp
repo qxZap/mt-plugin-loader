@@ -533,8 +533,9 @@ static void __fastcall hookPE(uintptr_t self, uintptr_t func, void* parms, uintp
                 // Where the call came from: the return address of THIS function is
                 // the address the caller will resume at, i.e. inside the native
                 // code that called ProcessEvent. That is the address a detour
-                // would have to target.
-                logf("watch fire: %s from %p", name(idx).c_str(), (void*)_ReturnAddress());
+                // would have to target. Only with a log: name() allocates, and this
+                // is the game thread.
+                if (g_log) logf("watch fire: %s from %p", name(idx).c_str(), (void*)_ReturnAddress());
                 if (g_watchFn[i](self, func, parms, g_watchCtx[i]))
                     return;  // a watcher blocked the call: do not run the original
             }
@@ -667,6 +668,16 @@ static DWORD WINAPI discover(LPVOID) {
                g_peIndex, slots, slots ? "runs" : "DISABLED");
       }
 
+    // Capitalist Economy owned this switch before the loader did; inherit its value.
+    // Through the store, so the read cannot land in the middle of a plugin's write.
+    std::wstring mb;
+    g_ini.get(L"capitalist_economy.ini", L"Mappings", L"Export", mb);
+      int was = _wtoi(mb.c_str());
+      const bool exportMappings = iniInt(L"Mappings", L"Export", was) != 0;
+      const bool exportCvars = iniInt(L"Mappings", L"ExportCvars", 0) != 0;
+      // Everything below only serves the exports: with both off, stop scanning.
+      if (!exportMappings && !exportCvars) return 0;
+
     // The world is up once MTDeliverySystem exists: the classes it uses are loaded.
     uintptr_t sysCls = findObject("Class", "MTDeliverySystem", "/Script/MotorTown");
     for (bool up = false; !up; ) {
@@ -677,14 +688,9 @@ static DWORD WINAPI discover(LPVOID) {
         }
     }
     Sleep(10000);
-    // Capitalist Economy owned this switch before the loader did; inherit its value.
-    // Through the store, so the read cannot land in the middle of a plugin's write.
-    std::wstring mb;
-    g_ini.get(L"capitalist_economy.ini", L"Mappings", L"Export", mb);
-      int was = _wtoi(mb.c_str());
-      if (iniInt(L"Mappings", L"Export", was)) dumpMappings(m);
+      if (exportMappings) dumpMappings(m);
       // One file next to the mappings, for a modeller to look at and change.
-      if (iniInt(L"Mappings", L"ExportCvars", 0)) logf("cvars: %d exported to mt_loader_cvars.txt", dumpCvars());
+      if (exportCvars) logf("cvars: %d exported to mt_loader_cvars.txt", dumpCvars());
       return 0;
   }
 
