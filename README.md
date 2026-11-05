@@ -83,8 +83,11 @@ Two things a plugin author needs to know, both learned the hard way:
   fire, on either side. Anything that has to see an RPC needs `watch_functions`
   on the exec side, a native hook, or a code patch.
 - `watch_functions` resolves each name to an FName index once and compares
-  indices per call, so watching is cheap; duplicate registrations are ignored,
-  and a name whose class is not loaded yet is simply not registered (retry).
+  indices per call, so watching is cheap. Registering the same callback and ctx
+  again is ignored; another callback on the same function is a separate watcher,
+  so two plugins can watch one function. A name whose class is not loaded yet is
+  simply not registered (retry). Watchers on one function run in registration
+  order, and one that blocks the call also stops the ones after it.
 
 ## Ini files: the loader owns them
 

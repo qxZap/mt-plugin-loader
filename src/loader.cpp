@@ -491,9 +491,11 @@ static int findProcessEvent(uintptr_t anyObject) {
 }
 
 // ---- function watchers: a plugin gets called back when a UFunction fires ----
-// A fixed table, published by count: the game thread reads it without a lock,
-// the plugin thread only ever appends. Cheap enough for the hot path -- one
-// compare per watcher, and only when a watcher is armed.
+// A fixed table, published by count: the game thread reads it without a lock.
+// Plugins register from their own threads, so appends take g_watchLock. Cheap
+// enough for the hot path -- one compare per watcher, and only when a watcher
+// is armed.
+static CRITICAL_SECTION g_watchLock;
 static MtPeHookFn g_watchFn[4096];
 static void* g_watchCtx[4096];
 static uint32_t g_watchIdx[4096];
@@ -769,14 +771,21 @@ static int apiWatch(const char* const* names, int count, MtPeHookFn fn, void* ct
             logf("watch: '%s' is not loaded -- not registered", names[i] ? names[i] : "?");
             continue;
         }
+        EnterCriticalSection(&g_watchLock);
         LONG n = g_watchCount;
         bool dup = false;
-        for (LONG k = 0; k < n; k++) if (g_watchIdx[k] == idx && g_watchNum[k] == num) { dup = true; break; }
-        if (dup) { added++; continue; }              // already armed: registering again is a no-op
-        if (n >= 4096) { logf("watch: table full -- '%s' not registered", names[i]); break; }
-        g_watchIdx[n] = idx; g_watchNum[n] = num; g_watchFn[n] = fn; g_watchCtx[n] = ctx;
-        InterlockedExchange(&g_watchCount, n + 1);   // publishes the entry
-        logf("watch: '%s' -> FName %u:%u", names[i], idx, num);
+        // The same callback again is a no-op, so a plugin can retry a whole list.
+        // Another callback on the same function is a separate watcher.
+        for (LONG k = 0; k < n; k++)
+            if (g_watchIdx[k] == idx && g_watchNum[k] == num && g_watchFn[k] == fn && g_watchCtx[k] == ctx) { dup = true; break; }
+        bool full = !dup && n >= 4096;
+        if (!dup && !full) {
+            g_watchIdx[n] = idx; g_watchNum[n] = num; g_watchFn[n] = fn; g_watchCtx[n] = ctx;
+            InterlockedExchange(&g_watchCount, n + 1);   // publishes the entry
+        }
+        LeaveCriticalSection(&g_watchLock);
+        if (full) { logf("watch: table full -- '%s' not registered", names[i]); break; }
+        if (!dup) logf("watch: '%s' -> FName %u:%u", names[i], idx, num);
         added++;
     }
     return added ? 1 : 0;
@@ -830,6 +839,7 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD why, LPVOID) {
         g_self = h;
         g_gameThread = GetCurrentThreadId();
         InitializeCriticalSection(&g_queueLock);
+        InitializeCriticalSection(&g_watchLock);
         g_engineReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         g_log = logsOn() ? _wfopen((exeDir() + L"mt_loader.log").c_str(), L"w") : nullptr;
         // The loader owns the ini files the plugins write, so two plugins that
