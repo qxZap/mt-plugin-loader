@@ -12,7 +12,9 @@
 namespace mt {
 inline const MtApi* api;
 
-#define MT_LOG(...) ::mt::api->log(::mt::api, __VA_ARGS__)
+inline bool loggingOn();
+// With this plugin's log off, the arguments are not even evaluated: no name lookups, no strings.
+#define MT_LOG(...) (::mt::loggingOn() ? ::mt::api->log(::mt::api, __VA_ARGS__) : (void)0)
 
 template <class T> T get(uintptr_t p, T def = T{}) { T v; return api->read(p, &v, sizeof v) ? v : def; }
 inline bool rd(uintptr_t p, void* out, size_t n) { return api->read(p, out, n) != 0; }
@@ -28,6 +30,23 @@ inline uintptr_t superOf(uintptr_t c) { return get<uintptr_t>(c + L().struct_sup
 inline bool isCDO(uintptr_t o) { return (get<uint32_t>(o + L().obj_flags) & 0x10) != 0; }  // RF_ClassDefaultObject
 inline std::string objName(uintptr_t o) { return name(get<uint32_t>(o + L().obj_name)); }
 inline int off(uintptr_t cls, const char* n) { return api->field_offset(cls, n); }
+
+// A component a plugin makes, never culled by distance: the maps' cull-distance volumes drop small meshes a little way
+// off (2026-11-09: brakes, flames and plates vanished at a distance). Call before FinishAddComponent, which registers
+// it. Only a PrimitiveComponent has the flag; anything else (a light) is left alone.
+inline void neverCull(uintptr_t comp) {
+    static uintptr_t cPrim; static int oFlag = -2, oCached;
+    if (oFlag == -2) {
+        cPrim = api->find_object("Class", "PrimitiveComponent", "/Script/Engine");
+        oFlag = cPrim ? off(cPrim, "bNeverDistanceCull") : -1;
+        oCached = cPrim ? off(cPrim, "CachedMaxDrawDistance") : -1;
+    }
+    if (!comp || oFlag < 0 || !api->is_a(classOf(comp), cPrim)) return;
+    uint8_t b = get<uint8_t>(comp + oFlag) | 0x08;  // bNeverDistanceCull's bit in UE 5.5 (jmap: field_mask 8)
+    wr(comp + oFlag, &b, 1);
+    float zero = 0;
+    if (oCached >= 0) wr(comp + oCached, &zero, 4);
+}
 
 // The game exe's folder (Binaries\Win64). Settings live in its plugins folder: see iniFile.
 inline std::wstring gameDir() {
@@ -70,6 +89,24 @@ inline bool attach(const MtApi* a) {
     return true;
 }
 
+// The game's Effects quality (sg.EffectsQuality: 0 Low .. 3 Epic, 4 Cinematic), -1 if it cannot
+// be read. Game thread only. Plugins draw less on Low, so a weak PC still runs them.
+inline int effectsQuality() {
+    static uintptr_t cdo = api->find_object("KismetSystemLibrary", "Default__KismetSystemLibrary", "/Script/Engine");
+    static uintptr_t fn = api->find_object("Function", "GetConsoleVariableIntValue", "KismetSystemLibrary");
+    if (!cdo || !fn) return -1;
+    const wchar_t* key = L"sg.EffectsQuality";
+    struct { const wchar_t* data; int num, max; } in = {key, (int)wcslen(key) + 1, (int)wcslen(key) + 1};
+    unsigned char p[0x40] = {0};
+    int at = off(fn, "VariableName"), ret = off(fn, "ReturnValue");
+    if (at < 0 || ret < 0) return -1;
+    memcpy(p + at, &in, sizeof in);
+    api->process_event(cdo, fn, p);
+    int out = -1;
+    memcpy(&out, p + ret, 4);
+    return out;
+}
+
 // ---- ini files ----
 // The loader owns them, so two plugins that write the same file do not
 // overwrite each other: every key is written on its own, under one lock, and
@@ -80,9 +117,22 @@ inline bool attach(const MtApi* a) {
 // and always win (live state that must not wait).
 // iniGet reads the merged value: what was declared for the key, or what the
 // file holds. Empty if there is none.
-// [General] Logging in mt_loader.ini, for a plugin keeping work that only exists to be logged.
+// [General] Logging in mt_loader.ini, and [Logging] <Plugin> for this plugin alone (EcuTuning for
+// mt_plugin_EcuTuning.dll) -- the same rule the loader opens the log file by.
 inline bool loggingOn() {
-    static int on = GetPrivateProfileIntW(L"General", L"Logging", 0, (gameDir() + L"mt_loader.ini").c_str());
+    static int on = [] {
+        std::wstring ini = gameDir() + L"mt_loader.ini";
+        if (!GetPrivateProfileIntW(L"General", L"Logging", 0, ini.c_str())) return 0;
+        HMODULE self = nullptr;
+        wchar_t p[MAX_PATH] = L"";
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)&loggingOn, &self);
+        GetModuleFileNameW(self, p, MAX_PATH);
+        std::wstring who = wcsrchr(p, L'\\') ? wcsrchr(p, L'\\') + 1 : p;
+        if (who.size() > 4) who.resize(who.size() - 4);
+        if (_wcsnicmp(who.c_str(), L"mt_plugin_", 10) == 0) who = who.substr(10);
+        return (int)GetPrivateProfileIntW(L"Logging", who.c_str(), 1, ini.c_str());
+    }();
     return on != 0;
 }
 
