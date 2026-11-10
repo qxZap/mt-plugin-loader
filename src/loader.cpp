@@ -44,12 +44,41 @@ static HMODULE g_self;
 static DWORD g_gameThread;
 static FILE* g_log;
 
+// A line is formatted where it is logged and written by logWriter, so a plugin logging from the
+// game thread never waits on the disk. The writer wakes per line: a crash loses at most what it
+// had not reached yet.
+static CRITICAL_SECTION g_logLock;
+static std::vector<std::pair<FILE*, std::string>> g_logQueue;
+static HANDLE g_logWake;
+static DWORD WINAPI logWriter(LPVOID) {
+    std::vector<std::pair<FILE*, std::string>> lines;
+    std::vector<FILE*> touched;
+    for (;;) {
+        WaitForSingleObject(g_logWake, INFINITE);
+        EnterCriticalSection(&g_logLock); lines.swap(g_logQueue); LeaveCriticalSection(&g_logLock);
+        for (auto& l : lines) {
+            fputs(l.second.c_str(), l.first);
+            if (std::find(touched.begin(), touched.end(), l.first) == touched.end()) touched.push_back(l.first);
+        }
+        for (FILE* f : touched) fflush(f);
+        lines.clear(); touched.clear();
+    }
+}
 static void vlog(FILE* f, const char* fmt, va_list a) {
     if (!f) return;
     SYSTEMTIME t; GetLocalTime(&t);
-    fprintf(f, "%02d:%02d:%02d ", t.wHour, t.wMinute, t.wSecond);
-    vfprintf(f, fmt, a);
-    fputc('\n', f); fflush(f);
+    char head[16];
+    snprintf(head, sizeof head, "%02d:%02d:%02d ", t.wHour, t.wMinute, t.wSecond);
+    va_list b; va_copy(b, a);
+    int n = vsnprintf(nullptr, 0, fmt, b);
+    va_end(b);
+    std::string s(head);
+    size_t at = s.size();
+    s.resize(at + (n > 0 ? n : 0) + 1);
+    if (n > 0) vsnprintf(s.data() + at, n + 1, fmt, a);
+    s.back() = '\n';
+    EnterCriticalSection(&g_logLock); g_logQueue.emplace_back(f, std::move(s)); LeaveCriticalSection(&g_logLock);
+    SetEvent(g_logWake);
 }
 // [General] Logging=1 in mt_loader.ini. Off, no log file is even created.
 static bool logsOn() {
@@ -57,12 +86,37 @@ static bool logsOn() {
     wcscpy_s(wcsrchr(p, L'\\') + 1, MAX_PATH - (wcsrchr(p, L'\\') + 1 - p), L"mt_loader.ini");
     return GetPrivateProfileIntW(L"General", L"Logging", 0, p) != 0;
 }
+// [Logging] <Plugin>=0 in mt_loader.ini (EcuTuning, SearchBox ...): that one plugin writes no log.
+static bool pluginLogs(const std::wstring& who) {
+    wchar_t p[MAX_PATH]; GetModuleFileNameW(nullptr, p, MAX_PATH);
+    wcscpy_s(wcsrchr(p, L'\\') + 1, MAX_PATH - (wcsrchr(p, L'\\') + 1 - p), L"mt_loader.ini");
+    return GetPrivateProfileIntW(L"Logging", who.c_str(), 1, p) != 0;
+}
 static void logf(const char* fmt, ...) { va_list a; va_start(a, fmt); vlog(g_log, fmt, a); va_end(a); }
 
 static std::wstring exeDir() {
     wchar_t p[MAX_PATH]; GetModuleFileNameW(g_self, p, MAX_PATH);
     *(wcsrchr(p, L'\\') + 1) = 0;
     return p;
+}
+
+// plugins\logs\<who>\<game start, to the minute>.log, made if missing. A second start in the same
+// minute gets _1, _2 ... up to _100, which is reused past that.
+static std::wstring logFile(const std::wstring& who) {
+    static wchar_t stamp[32];
+    if (!stamp[0]) {
+        SYSTEMTIME t; GetLocalTime(&t);
+        swprintf_s(stamp, L"%04d-%02d-%02d_%02d-%02d", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
+    }
+    std::wstring dir = exeDir() + L"plugins\\logs\\";
+    CreateDirectoryW((exeDir() + L"plugins").c_str(), nullptr);
+    CreateDirectoryW(dir.c_str(), nullptr);
+    dir += who + L"\\";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    for (int n = 0;; n++) {
+        std::wstring f = dir + stamp + (n ? L"_" + std::to_wstring(n) : L"") + L".log";
+        if (n == 100 || GetFileAttributesW(f.c_str()) == INVALID_FILE_ATTRIBUTES) return f;
+    }
 }
 
 // UTF-8 in, UTF-16 out (the ini files are wide, like the profile API).
@@ -520,10 +574,34 @@ static bool funcFName(const char* nm, uint32_t* idx, uint32_t* num) {
 }
 
 static void __fastcall hookPE(uintptr_t self, uintptr_t func, void* parms, uintptr_t r9) {
-    if (g_queued && GetCurrentThreadId() == g_gameThread && InterlockedExchange(&g_queued, 0)) {
+    // Not while queued work is already running: a plugin's work calls ProcessEvent itself (making
+    // a widget, say), and draining here would run the next queued call inside the current one --
+    // the same plugin's tick re-entered under its own lock, which threw and took the game down.
+    static bool draining;
+    if (!draining && g_queued && GetCurrentThreadId() == g_gameThread && InterlockedExchange(&g_queued, 0)) {
+        draining = true;
         std::vector<std::pair<MtGameThreadFn, void*>> work;
         EnterCriticalSection(&g_queueLock); work.swap(g_queue); LeaveCriticalSection(&g_queueLock);
-        for (auto& w : work) w.first(w.second);
+        // Each plugin's game-thread work is timed, so a stall in the log names the plugin that
+        // caused it -- or, when no plugin is named, it was the game's own (GC, streaming).
+        static LARGE_INTEGER hz;
+        if (!hz.QuadPart) QueryPerformanceFrequency(&hz);
+        for (auto& w : work) {
+            LARGE_INTEGER a, b;
+            QueryPerformanceCounter(&a);
+            w.first(w.second);
+            QueryPerformanceCounter(&b);
+            double ms = (b.QuadPart - a.QuadPart) * 1000.0 / hz.QuadPart;
+            if (ms > 8) {
+                HMODULE m = nullptr;
+                char file[MAX_PATH] = "?";
+                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)w.first, &m))
+                    GetModuleFileNameA(m, file, MAX_PATH);
+                const char* base = strrchr(file, '\\');
+                logf("slow game-thread work: %s took %.1f ms", base ? base + 1 : file, ms);
+            }
+        }
+        draining = false;
     }
     LONG n = g_watchCount;
     if (n > 0) {
@@ -533,9 +611,10 @@ static void __fastcall hookPE(uintptr_t self, uintptr_t func, void* parms, uintp
                 // Where the call came from: the return address of THIS function is
                 // the address the caller will resume at, i.e. inside the native
                 // code that called ProcessEvent. That is the address a detour
-                // would have to target. Only with a log: name() allocates, and this
-                // is the game thread.
-                if (g_log) logf("watch fire: %s from %p", name(idx).c_str(), (void*)_ReturnAddress());
+                // would have to target.
+                // Once a watcher, and only with a log: name() allocates, and this is the game thread.
+                static bool said[4096];
+                if (g_log && !said[i]) { said[i] = true; logf("watch fire: %s from %p", name(idx).c_str(), (void*)_ReturnAddress()); }
                 if (g_watchFn[i](self, func, parms, g_watchCtx[i]))
                     return;  // a watcher blocked the call: do not run the original
             }
@@ -829,8 +908,9 @@ static DWORD WINAPI loadPlugins(LPVOID) {
         auto init = (MtPluginInitFn)GetProcAddress(mod, "PluginInit");
         if (!init) { logf("plugin %s: PluginInit vanished on load", nm.c_str()); continue; }
         auto* p = new Plugin{ nm, nullptr, order++, {} };  // lives for the process
-        std::wstring logPath = path.substr(0, path.size() - 4) + L".log";
-        p->log = logsOn() ? _wfopen(logPath.c_str(), L"w") : nullptr;
+        std::wstring who = f.substr(0, f.size() - 4);  // mt_plugin_EcuTuning.dll -> EcuTuning
+        if (_wcsnicmp(who.c_str(), L"mt_plugin_", 10) == 0) who = who.substr(10);
+        p->log = logsOn() && pluginLogs(who) ? _wfopen(logFile(who).c_str(), L"w") : nullptr;
         p->api = { MT_API_VERSION, sizeof(MtApi), apiLog, apiWait, &g_layout, apiRead, apiWrite, apiName, apiFname,
                      apiNum, apiObject, apiFind, apiIsA, apiField, apiFieldOffset, apiRun, apiPE, apiHooked, p, apiWatch, apiNameIndex, apiPatch, apiModuleBase, apiIniSet, apiIniGet, apiPoolNames };
         int rc = init(&p->api);
@@ -846,8 +926,11 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD why, LPVOID) {
         g_gameThread = GetCurrentThreadId();
         InitializeCriticalSection(&g_queueLock);
         InitializeCriticalSection(&g_watchLock);
+        InitializeCriticalSection(&g_logLock);
+        g_logWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        CloseHandle(CreateThread(nullptr, 0, logWriter, nullptr, 0, nullptr));
         g_engineReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        g_log = logsOn() ? _wfopen((exeDir() + L"mt_loader.log").c_str(), L"w") : nullptr;
+        g_log = logsOn() ? _wfopen(logFile(L"Loader").c_str(), L"w") : nullptr;
         // The loader owns the ini files the plugins write, so two plugins that
         // set different keys of the same file cannot overwrite each other.
         g_ini.init(exeDir(), iniLog);
