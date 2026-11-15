@@ -99,11 +99,11 @@ loser takes the winner's file with it.
 
 ```c
 // a default: the file's own value wins, so a hand-edited file is kept
-iniSet(L"custom_wheel_scale.ini", L"WheelScale", L"Min", L"0.1");
+iniSet(L"swim.ini", L"Swim", L"FloatDepth", L"60");
 // live state: written through at once, always wins
 iniSet(L"moretuning.ini", section, key, value, true);
 // what the merged view says
-std::wstring v = iniGet(L"custom_wheel_scale.ini", L"WheelScale", L"Min");
+std::wstring v = iniGet(L"swim.ini", L"Swim", L"FloatDepth");
 ```
 
 `mt::iniNum` / `mt::iniInt` in `include/mt_plugin.hpp` do the declare-then-read
