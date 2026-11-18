@@ -18,3 +18,11 @@ for the ini merge, the one part of the loader with no game in the loop.
 - `[Mappings] Export=1` in `mt_loader.ini` writes `Mappings.usmap` about 10 seconds after
   the game's systems load, so a crash at startup means no dump.
 - Every plugin repo carries a copy of `include/`. Changing the api means updating those.
+
+## Releases
+
+Released dlls are built by GitHub, not on a dev machine, so anyone (Nexus's reviewers too) can
+match a download to the source. Branch `release/<version>` off main and push it:
+`.github/workflows/release.yml` runs `build.bat` (ini test included) and publishes the GitHub
+release `v<version>` with the drag-and-drop zip, the bare `version.dll` and `SHA256SUMS.txt`.
+Pushing the branch again rebuilds that release. Bump `src/version.rc` for a new version.
