@@ -1,0 +1,50 @@
+# Push a branch named release/<version> (release/1.0, release/1.1, ...) and this builds the loader
+# from that branch on GitHub's machine, runs the ini test, and publishes the GitHub release v<version>:
+# the Nexus-ready zip, the bare version.dll and their SHA-256. Pushing the branch again rebuilds it.
+name: release
+on:
+  push:
+    branches: ["release/**"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        shell: cmd
+        run: build.bat
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}" -replace '^release/', ''
+          $stage = "stage"
+          New-Item -ItemType Directory -Force "$stage/MotorTown/Binaries/Win64" | Out-Null
+          Copy-Item out/version.dll "$stage/MotorTown/Binaries/Win64/"
+          Copy-Item dist/README.txt $stage
+          $zip = "Plugin-Loader-$v.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $zip
+          Copy-Item out/version.dll version.dll
+          Get-FileHash version.dll, $zip -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } | Set-Content SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+          "VERSION=$v" >> $env:GITHUB_ENV
+          "ZIP=$zip" >> $env:GITHUB_ENV
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-loader
+          path: |
+            ${{ env.ZIP }}
+            version.dll
+            SHA256SUMS.txt
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/heads/release/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$VERSION"
+          gh release delete "$tag" --cleanup-tag -y || true
+          gh release create "$tag" "$ZIP" version.dll SHA256SUMS.txt --target "$GITHUB_SHA" --title "Plugin Loader $VERSION" \
+            --notes "Built by GitHub Actions from \`$GITHUB_SHA\` on branch \`$GITHUB_REF_NAME\` ([build log]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)). The zip is the drag-and-drop download; SHA256SUMS.txt has the hashes."
