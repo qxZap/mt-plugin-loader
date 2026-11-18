@@ -180,9 +180,36 @@ int main() {
         DeleteFileW(ini);
     }
 
+    // 5. a file with a UTF-8 BOM (what Notepad and many editors write): the
+    // profile API cannot see the first section at all, so a value the user set
+    // there reads as absent -- and the loader's own write appends a second copy
+    // of the section. 2026-11-16: a plugin's [General] Disabled=1 was
+    // invisible, the plugin ran anyway, and it crashed the game three times.
+    {
+        wchar_t bom[MAX_PATH];
+        swprintf(bom, MAX_PATH, L"%s\\bom.ini", dir.c_str());
+        {
+            const unsigned char body[] = {0xEF, 0xBB, 0xBF, '[', 'G', 'e', 'n', 'e', 'r', 'a', 'l', ']',
+                                          '\r', '\n', 'D', 'i', 's', 'a', 'b', 'l', 'e', 'd', '=', '1',
+                                          '\r', '\n', '[', 'O', 't', 'h', 'e', 'r', ']', '\r', '\n',
+                                          'K', 'e', 'y', '=', 'k', 'e', 'e', 'p', '\r', '\n', 0};
+            HANDLE h = CreateFileW(bom, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            DWORD n = 0;
+            WriteFile(h, body, (DWORD)(sizeof body - 1), &n, nullptr);
+            CloseHandle(h);
+        }
+        std::wstring v;
+        bool saw = store.get(L"bom.ini", L"General", L"Disabled", v);
+        check(saw && v == L"1", "a value in the first section of a BOM'd file is read");
+        store.declare(L"bom.ini", L"General", L"Disabled", L"0", false, L"Test.dll", 0, nullptr);
+        check(onDisk(dir, L"bom.ini", L"General", L"Disabled") == L"1", "the user's value in a BOM'd file is not overwritten");
+        check(onDisk(dir, L"bom.ini", L"Other", L"Key") == L"keep", "the other section of a BOM'd file survives");
+        DeleteFileW(bom);
+    }
+
     printf("\n%d checks, %d failed\n", g_checks, g_fail);
     // Leave no litter behind.
-    for (const wchar_t* f : {L"settings.ini", L"fresh.ini", L"order.ini"}) {
+    for (const wchar_t* f : {L"settings.ini", L"fresh.ini", L"order.ini", L"bom.ini"}) {
         wchar_t p[MAX_PATH];
         swprintf(p, MAX_PATH, L"%s\\%ls", dir.c_str(), f);
         DeleteFileW(p);

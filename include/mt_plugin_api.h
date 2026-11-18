@@ -21,7 +21,7 @@
 #include <stdint.h>
 #include <wchar.h>
 
-#define MT_API_VERSION 6
+#define MT_API_VERSION 8
 
 /* Offsets the loader detected at runtime (nothing here is hardcoded). */
 typedef struct MtLayout {
@@ -131,6 +131,24 @@ typedef struct MtApi {
        so their names are pool entries and not strings in the binary.
        Returns how many names were handed over. */
     int (*pool_names)(int (*fn)(const char* name, void* ctx), void* ctx);
+    /* ---- v7 ----
+       Keep an object for the rest of the session (AddToRoot): for assets a plugin loads and gives to engine
+       components, which nothing in the engine references, so a GC would free them while still in use.
+       Returns 1 when done, 0 when the loader could not learn the object flags (then keep the object some other way).
+       Since v7 object() also returns 0 for an object the game destroyed but has not collected yet. */
+    int (*keep)(uintptr_t obj);
+    /* ---- v8 ----
+       The game is on its way out. Returns 1 once the engine has started to shut down, and stays 1.
+       The loader knows it because the world is gone and no new one comes: a map travel brings a new
+       world within a second or two, the exit brings none.
+       While this is 1 the loader does not run any plugin work (no game-thread queue, no watched
+       function) and every api->process_event does nothing -- so a plugin cannot touch the engine
+       while the engine is taking itself apart. That is what the game hung on: a plugin's tick ran
+       inside the teardown and waited for a lock one of its own threads held while it was inside
+       the engine (the user, 2026-11-17: "whenever I'm closing the game it gets stuck on stopping").
+       A plugin's own thread should watch this and end itself: if (api->stopping()) return 0;
+     */
+    int (*stopping)(void);
 } MtApi;
 
 typedef int (*MtPluginInitFn)(const MtApi* api);

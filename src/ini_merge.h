@@ -24,11 +24,49 @@
 #include <windows.h>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <tuple>
 #include <vector>
 
 namespace ini {
+
+// The Windows profile API reads an ini file as ANSI, so a UTF-8 BOM lands in
+// front of the first "[Section]" line and that section is never seen: its keys
+// read as absent, and a write appends a second copy of the section instead of
+// updating the first. 2026-11-16: a plugin's [General] Disabled=1 was
+// invisible, the loader wrote its own Disabled=0 beside it, and the plugin
+// kept running -- and crashed the game three times.
+//
+// The loader owns these files, so it strips the BOM the first time it touches
+// one and the file is otherwise left exactly as it was. The rewrite goes
+// through a temp file, so a failure leaves the original alone.
+inline void stripBom(const std::wstring& path) {
+    static std::mutex m;
+    std::lock_guard<std::mutex> g(m);
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    unsigned char head[3] = {0, 0, 0};
+    DWORD got = 0;
+    bool bom = ReadFile(h, head, 3, &got, nullptr) && got == 3 &&
+               head[0] == 0xEF && head[1] == 0xBB && head[2] == 0xBF;
+    if (!bom) { CloseHandle(h); return; }
+    std::string body;
+    char buf[4096];
+    DWORD n = 0;
+    while (ReadFile(h, buf, sizeof buf, &n, nullptr) && n) body.append(buf, n);
+    CloseHandle(h);
+    std::wstring tmp = path + L".nobom";
+    HANDLE w = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (w == INVALID_HANDLE_VALUE) return;
+    DWORD put = 0;
+    WriteFile(w, body.data(), (DWORD)body.size(), &put, nullptr);
+    CloseHandle(w);
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(tmp.c_str());
+    }
+}
 
 // GetPrivateProfileSectionW hands back one string: key=value pairs with NULs
 // between them, not one line per pair. Walking it as if it were an array of
@@ -144,7 +182,9 @@ private:
         wchar_t buf[1024];
         // The default tells "not there" from "there but empty".
         static const wchar_t kAbsent[] = L"\x01absent";
-        GetPrivateProfileStringW(section.c_str(), key.c_str(), kAbsent, buf, 1024, path(file).c_str());
+        std::wstring p = path(file);
+        stripBom(p);
+        GetPrivateProfileStringW(section.c_str(), key.c_str(), kAbsent, buf, 1024, p.c_str());
         if (!wcscmp(buf, kAbsent) || !buf[0]) return false;
         out = buf;
         return true;
@@ -154,6 +194,7 @@ private:
     // line in it -- comments, other sections, other keys.
     void write(const std::wstring& file, const std::wstring& section, const std::wstring& key, const std::wstring& value) {
         std::wstring p = path(file);
+        stripBom(p);
         size_t slash = p.find_last_of(L'\\');
         if (slash != std::wstring::npos) {          // the folder has to exist
             CreateDirectoryW(p.substr(0, slash).c_str(), nullptr);

@@ -1,4 +1,4 @@
-// Motor Town native plugin loader -- version.dll.
+﻿// Motor Town native plugin loader -- version.dll.
 //
 // The game exe imports version.dll and Windows looks beside the exe first, so
 // this file forwards every export to the real System32 DLL and, on load:
@@ -16,6 +16,7 @@
 // lifted from capitalist_economy\src\dllmain.cpp, where they were proven on
 // 0.7.20 (ProcessEvent is vtable entry 79 there; it is found, not assumed).
 
+#include <thread>
 #include <windows.h>
 #include <algorithm>
 #include <cstdarg>
@@ -24,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <set>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -84,12 +86,14 @@ static void vlog(FILE* f, const char* fmt, va_list a) {
 static bool logsOn() {
     wchar_t p[MAX_PATH]; GetModuleFileNameW(nullptr, p, MAX_PATH);
     wcscpy_s(wcsrchr(p, L'\\') + 1, MAX_PATH - (wcsrchr(p, L'\\') + 1 - p), L"mt_loader.ini");
+    ini::stripBom(p);
     return GetPrivateProfileIntW(L"General", L"Logging", 0, p) != 0;
 }
 // [Logging] <Plugin>=0 in mt_loader.ini (EcuTuning, SearchBox ...): that one plugin writes no log.
 static bool pluginLogs(const std::wstring& who) {
     wchar_t p[MAX_PATH]; GetModuleFileNameW(nullptr, p, MAX_PATH);
     wcscpy_s(wcsrchr(p, L'\\') + 1, MAX_PATH - (wcsrchr(p, L'\\') + 1 - p), L"mt_loader.ini");
+    ini::stripBom(p);
     return GetPrivateProfileIntW(L"Logging", who.c_str(), 1, p) != 0;
 }
 static void logf(const char* fmt, ...) { va_list a; va_start(a, fmt); vlog(g_log, fmt, a); va_end(a); }
@@ -297,9 +301,23 @@ static bool findObjectArray() {
     return false;
 }
 static int numObjects() { return get<int>(g_numAddr); }
-static uintptr_t object(int i) {
+// FUObjectItem's internal flags (2026-11-12, crash hunt): an actor or component the game destroyed is marked Garbage at
+// once but stays in the table until a GC purges it, up to a minute later. Every plugin's alive check (object(i) == ptr)
+// passed for it, and their calls on it are what the engine tripped over later. So object() hides it. The flag word's
+// place is learnt at start (native classes carry Native and RootSet); -1 = not learnt, nothing hidden.
+static int g_itemFlags = -1;
+static volatile uint32_t g_tickIdx;  // FName index of ReceiveTick, learnt with the flags
+constexpr int kGarbage = 1 << 21, kNative = 1 << 25, kRootSet = 1 << 30;  // EInternalObjectFlags, UE 5.5
+static uintptr_t itemOf(int i) {
     uintptr_t c = get<uintptr_t>(g_chunks + 8ull * (i / kChunk));
-    return c ? get<uintptr_t>(c + (uintptr_t)(i % kChunk) * g_stride) : 0;
+    return c ? c + (uintptr_t)(i % kChunk) * g_stride : 0;
+}
+static uintptr_t object(int i) {
+    uintptr_t it = itemOf(i);
+    if (!it) return 0;
+    uintptr_t o = get<uintptr_t>(it);
+    if (o && g_itemFlags >= 0 && (get<int>(it + g_itemFlags) & kGarbage)) return 0;
+    return o;
 }
 static std::string objName(uintptr_t o) { return name(get<uint32_t>(o + oName)); }
 static uintptr_t findObject(const char* cls, const char* nm, const char* outer) {
@@ -517,6 +535,9 @@ static int g_peIndex = -1;
 static CRITICAL_SECTION g_queueLock;
 static std::vector<std::pair<MtGameThreadFn, void*>> g_queue;
 static volatile LONG g_queued;
+// The game is on its way out. Set by the world watcher below: the world is gone and no new one
+// comes (a map travel brings one within a second or two, the exit brings none).
+static volatile LONG g_stopping;
 
 static bool inText(uintptr_t a) { Range t = section(".text"); return a >= t.lo && a < t.hi; }
 
@@ -578,7 +599,26 @@ static void __fastcall hookPE(uintptr_t self, uintptr_t func, void* parms, uintp
     // a widget, say), and draining here would run the next queued call inside the current one --
     // the same plugin's tick re-entered under its own lock, which threw and took the game down.
     static bool draining;
+    // 2026-11-12, crash hunt: draining inside ANY ProcessEvent ran the plugins' component and widget work in the middle
+    // of whatever the engine was doing then (an EndPlay, an overlap, a Slate paint), adding or removing entries of lists
+    // the engine was walking. Now it waits for an actor's ReceiveTick, the normal place for such work; if no ReceiveTick
+    // came in the last 100 ms (main menu, loading) it drains anywhere, as before.
+    static ULONGLONG lastTick;
+    if (g_queued && GetCurrentThreadId() == g_gameThread) {
+        bool atTick = g_tickIdx && get<uint32_t>(func + oName) == g_tickIdx;
+        ULONGLONG nowMs = GetTickCount64();
+        if (atTick) lastTick = nowMs;
+        if (!atTick && nowMs - lastTick < 100) goto watch;
+    }
     if (!draining && g_queued && GetCurrentThreadId() == g_gameThread && InterlockedExchange(&g_queued, 0)) {
+        // The game is closing: no plugin work runs any more (2026-11-17: the game hung on
+        // "stopping" -- a plugin's tick ran inside the teardown and waited for a lock one of its
+        // own threads held while it was inside the engine). The queue is emptied, not run.
+        if (InterlockedCompareExchange(&g_stopping, 0, 0)) {
+            std::vector<std::pair<MtGameThreadFn, void*>> drop;
+            EnterCriticalSection(&g_queueLock); drop.swap(g_queue); LeaveCriticalSection(&g_queueLock);
+            goto watch;
+        }
         draining = true;
         std::vector<std::pair<MtGameThreadFn, void*>> work;
         EnterCriticalSection(&g_queueLock); work.swap(g_queue); LeaveCriticalSection(&g_queueLock);
@@ -603,6 +643,9 @@ static void __fastcall hookPE(uintptr_t self, uintptr_t func, void* parms, uintp
         }
         draining = false;
     }
+watch:
+    // The game is closing: a watched function must not run a plugin's code either.
+    if (InterlockedCompareExchange(&g_stopping, 0, 0)) return;
     LONG n = g_watchCount;
     if (n > 0) {
         uint32_t idx = get<uint32_t>(func + oName), num = get<uint32_t>(func + oName + 4);
@@ -703,6 +746,41 @@ static int installHook(uintptr_t anyObject) {
       return n;
   }
 
+  // A guarded read of the object array's count and of one item in it. During the game's teardown the array is being
+  // freed and its count can read as a wild number, and an unguarded walk then runs for hours -- which is what the game
+  // sat on "Stopping" over (2026-11-15).
+  static int safeCount() {
+      int n = 0;
+      __try { n = get<int>(g_numAddr); } __except (EXCEPTION_EXECUTE_HANDLER) { n = 0; }
+      return n;
+  }
+  static uintptr_t safeItem(int i) {
+      uintptr_t o = 0;
+      __try {
+          uintptr_t c = get<uintptr_t>(g_chunks + 8ull * (i / kChunk));
+          if (!c) return 0;
+          o = get<uintptr_t>(c + (uintptr_t)(i % kChunk) * g_stride);
+      } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+      return o;
+  }
+  // A name from the pool into a buffer, guarded: the pool is being freed during the teardown too.
+  static bool safeNameTo(uint32_t idx, char* buf, int cap) {
+      if (!buf || cap <= 1) return false;
+      buf[0] = 0;
+      __try {
+          uintptr_t blk = get<uintptr_t>(g_blocks + 8ull * (idx >> 16));
+          if (!blk) return false;
+          uintptr_t e = blk + 2ull * (idx & 0xFFFF);
+          uint16_t h = get<uint16_t>(e);
+          int len = h >> 6;
+          if (len <= 0 || len > cap - 1) return false;
+          if (h & 1) { for (int i = 0; i < len; i++) buf[i] = (char)get<uint16_t>(e + 2 + 2ull * i); }
+          else { for (int i = 0; i < len; i++) buf[i] = (char)get<uint8_t>(e + 2 + i); }
+          buf[len] = 0;
+          return true;
+      } __except (EXCEPTION_EXECUTE_HANDLER) { buf[0] = 0; return false; }
+  }
+
   // ---- engine discovery, once ----
 static HANDLE g_engineReady;  // manual-reset event
 static MtLayout g_layout;
@@ -710,10 +788,75 @@ static MtLayout g_layout;
 static int iniInt(const wchar_t* sec, const wchar_t* key, int def) {
     std::wstring ini = exeDir() + L"mt_loader.ini";
     wchar_t b[64];
+    ini::stripBom(ini);
     if (!GetPrivateProfileStringW(sec, key, L"", b, 64, ini.c_str())) {
         swprintf(b, 64, L"%d", def); WritePrivateProfileStringW(sec, key, b, ini.c_str()); return def;
     }
     return _wtoi(b);
+}
+
+// Which int of FUObjectItem holds the internal flags: the one where native /Script classes have Native and RootSet set.
+static void learnItemFlags() {
+    for (int off : {8, 12, 16}) {
+        if (off + 4 > g_stride) continue;
+        int classes = 0, hits = 0, garbage = 0, seen = 0;
+        for (int i = 0, n = numObjects(); i < n && i < 200000; i++) {
+            uintptr_t it = itemOf(i), o = it ? get<uintptr_t>(it) : 0;
+            if (!o) continue;
+            seen++;
+            int f = get<int>(it + off);
+            if (f & kGarbage) garbage++;
+            uintptr_t cls = get<uintptr_t>(o + oClass), outer = get<uintptr_t>(o + oOuter);
+            if (!cls || !outer || objName(cls) != "Class" || objName(outer).rfind("/Script/", 0) != 0) continue;
+            classes++;
+            if ((f & (kNative | kRootSet)) == (kNative | kRootSet)) hits++;
+        }
+        logf("object flags at +%d: %d of %d native classes rooted, %d of %d garbage", off, hits, classes, garbage, seen);
+        if (classes > 200 && hits * 10 >= classes * 9 && garbage * 20 < seen) { g_itemFlags = off; break; }
+    }
+    logf(g_itemFlags >= 0 ? "object flags learnt (+%d): destroyed objects hidden, keep() on" : "object flags NOT learnt (%d): no hiding, keep() off", g_itemFlags);
+}
+
+// The game is on its way out -- the world is gone and no new one comes.
+//
+// A map travel takes the world with it and brings a new one within a second or two; the exit
+// brings none. So the world is watched, and when it has been gone for a few seconds the session
+// is over: the flag tells the plugins to end their threads, and the loader stops running any
+// plugin work (no queue, no watched function, no call into the engine).
+//
+// The user, 2026-11-17: "whenever I'm closing the game it gets stuck on stopping -- it is
+// definitely the plugins".
+static DWORD WINAPI watchWorld(LPVOID) {
+    uintptr_t worldCls = 0;
+    for (int i = 0, n = numObjects(); i < n; i++) {
+        uintptr_t o = object(i);
+        if (o && objName(get<uintptr_t>(o + oClass)) == "World" && objName(get<uintptr_t>(o + oOuter)) == "/Script/Engine") { worldCls = o; break; }
+    }
+    if (!worldCls) { logf("no world class: the exit is not watched"); return 0; }
+    int held = 0;              // seconds the world has been gone
+    uintptr_t world = 0;
+    int worldIdx = -1;
+    for (;;) {
+        Sleep(1000);
+        if (InterlockedCompareExchange(&g_stopping, 0, 0)) return 0;
+        // the world we are in, if it is still there
+        if (world && worldIdx >= 0 && object(worldIdx) == world) { held = 0; continue; }
+        // look for a world: a new one means a map travel, none means the exit
+        uintptr_t found = 0; int foundIdx = -1;
+        for (int i = 0, n = numObjects(); i < n; i++) {
+            uintptr_t o = object(i);
+            if (!o) continue;
+            if (get<uintptr_t>(o + oClass) != worldCls) continue;
+            if (get<uint32_t>(o + oFlags) & 0x10) continue;   // the class default object
+            found = o; foundIdx = i; break;
+        }
+        if (found) { world = found; worldIdx = foundIdx; held = 0; continue; }
+        if (++held >= 5) {
+            InterlockedExchange(&g_stopping, 1);
+            logf("the world is gone and no new one came: the game is closing, the plugins stop");
+            return 0;
+        }
+    }
 }
 
 static DWORD WINAPI discover(LPVOID) {
@@ -731,9 +874,32 @@ static DWORD WINAPI discover(LPVOID) {
         oSuper = oChildProps = fNext = fName = -1;
         Sleep(2000);
     }
+    learnItemFlags();
+    g_tickIdx = nameIndexOf("ReceiveTick");
+    logf("safe point for plugin work: ReceiveTick (name %u)", g_tickIdx);
     auto m = fields(cargo);
     if (!learnOffset(m)) { logf("FAILED: property Offset_Internal not found -- plugins get no engine"); return 0; }
     g_layout = { oFlags, oIndex, oClass, oName, oOuter, oSuper, oChildProps, fNext, fName, fOffset, g_stride };
+    // MTCargo existing is not everything existing: native classes and their functions register in batches, module by
+    // module. 2026-11-13 17:18 the engine was "ready" 3 s after start and eight plugins found functions missing (Boats,
+    // Swim, Rear Cam, Time Keys ...). So also wait for one marker per module the plugins lean on, then 2 s more.
+    {
+        struct { const char *cls, *name, *outer; } marks[] = {
+            {"Function", "IsIgnitionOn", "MTEngineComponent"},         // MotorTown's functions
+            {"Function", "GetPlayerPawn", "GameplayStatics"},          // Engine
+            {"Class", "WaterBodyOcean", "/Script/Water"},              // Water
+            {"Function", "Montage_Play", "AnimInstance"},              // animation
+            {"Function", "CreateDynamicMaterialInstance", "KismetMaterialLibrary"},
+        };
+        int waited = 0;
+        for (auto& mk : marks)
+            while (!findObject(mk.cls, mk.name, mk.outer)) {
+                if (waited >= 120) { logf("engine: %s %s still missing after 2 min -- going on", mk.cls, mk.name); break; }
+                Sleep(1000); waited++;
+            }
+        if (waited) logf("engine: waited %d s for every module to register", waited);
+        Sleep(2000);
+    }
       logf("engine ready: super+%x props+%x next+%x name+%x offset+%x", oSuper, oChildProps, fNext, fName, fOffset);
       SetEvent(g_engineReady);
 
@@ -747,6 +913,50 @@ static DWORD WINAPI discover(LPVOID) {
                g_peIndex, slots, slots ? "runs" : "DISABLED");
       }
 
+    // The memory watch: the live object count and the open handles, every 10 s. A leak that grows the object count is
+    // the game's own (something is never collected); one that grows without it is native memory -- a texture, a mesh.
+    // The walk is guarded: a count that is not a plain number means the game is tearing down, and the walk is skipped
+    // rather than started (2026-11-15: an unguarded walk on a wild count is what held the game on "Stopping").
+    {
+        static std::unordered_map<uintptr_t, int> prevLive;  // the thread outlives this block
+        std::thread([] {
+            for (int i = 0; i < 600; i++) {
+                Sleep(10000);
+                if (WaitForSingleObject(g_engineReady, 0) != WAIT_OBJECT_0) continue;  // the engine is up
+                DWORD handles = 0;
+                GetProcessHandleCount(GetCurrentProcess(), &handles);
+                int n = safeCount();
+                if (n <= 0 || n > 4000000) { logf("memory: the object count reads %d -- the game is tearing down, skipping the walk", n); continue; }
+                int live = 0;
+                std::unordered_map<uintptr_t, int> now;
+                for (int k = 0; k < n; k++) {
+                    uintptr_t o = safeItem(k);
+                    if (!o) continue;
+                    live++;
+                    now[get<uintptr_t>(o + oClass)]++;
+                }
+                logf("memory: %d objects in the table, %d live, %u handles open", n, live, handles);
+                std::vector<std::pair<int, uintptr_t>> diff;
+                for (auto& [cls, c] : now) {
+                    auto it = prevLive.find(cls);
+                    int before = it == prevLive.end() ? 0 : it->second;
+                    if (c > before) diff.push_back({c - before, cls});
+                }
+                std::sort(diff.begin(), diff.end(), [](auto& a, auto& b) { return a.first > b.first; });
+                std::string top;
+                for (int k = 0; k < (int)diff.size() && k < 10; k++) {
+                    char nm[128] = {0};
+                    if (!safeNameTo(get<uint32_t>(diff[k].second + oName), nm, sizeof nm)) continue;  // the pool is gone
+                    char b[160];
+                    snprintf(b, sizeof b, "%s%s %+d", k ? ", " : "", nm, diff[k].first);
+                    top += b;
+                }
+                if (!top.empty()) logf("new live objects since the last look: %s", top.c_str());
+                prevLive.swap(now);
+            }
+        }).detach();
+    }
+
     // Capitalist Economy owned this switch before the loader did; inherit its value.
     // Through the store, so the read cannot land in the middle of a plugin's write.
     std::wstring mb;
@@ -757,8 +967,10 @@ static DWORD WINAPI discover(LPVOID) {
       // Everything below only serves the exports: with both off, stop scanning.
       if (!exportMappings && !exportCvars) return 0;
 
-    // The world is up once MTDeliverySystem exists: the classes it uses are loaded.
-    uintptr_t sysCls = findObject("Class", "MTDeliverySystem", "/Script/MotorTown");
+    // The world is up once a UWorld exists: the classes it uses are loaded. (2026-11-15: this waited for
+    // MTDeliverySystem, which only ever exists in the company map -- so the export never ran on the harbour map and
+    // the mappings after a game update were never written.)
+    uintptr_t sysCls = findObject("Class", "World", "/Script/Engine");
     for (bool up = false; !up; ) {
         Sleep(1000);
         for (int i = 0, n = numObjects(); i < n && !up; i++) {
@@ -810,10 +1022,38 @@ static int apiPatch(uintptr_t addr, const void* bytes, int len) {
   static uintptr_t apiModuleBase() { return (uintptr_t)GetModuleHandleW(nullptr); }
   static int apiNum() { return numObjects(); }
   static uintptr_t apiObject(int i) { return object(i); }
-  static uintptr_t apiFind(const char* c, const char* n, const char* o) { return findObject(c, n, o); }
+  // An asset a plugin loaded and hands to engine components: nothing in the engine references it, so a GC would free
+  // it under them. Rooted for the rest of the session (the AddToRoot flag). 1 = done.
+  static int apiKeep(uintptr_t o) {
+      if (g_itemFlags < 0 || !o) return 0;
+      int i = get<int>(o + oIndex, -1);
+      uintptr_t it = i >= 0 ? itemOf(i) : 0;
+      if (!it || get<uintptr_t>(it) != o) return 0;
+      _InterlockedOr((volatile long*)(it + g_itemFlags), kRootSet);
+      return 1;
+  }
+  // The game is on its way out. A plugin's own thread watches this and ends itself.
+  static int apiStopping() { return InterlockedCompareExchange(&g_stopping, 0, 0) != 0; }
+  // every lookup a plugin makes that finds nothing, once each: after a game update this is the list of what moved
+  // (some plugins probe optional names, so not every line is a fault)
+  static void miss(const std::string& what) {
+      static std::mutex m; static std::set<std::string> seen;
+      std::lock_guard<std::mutex> g(m);
+      if (seen.insert(what).second) logf("miss: %s", what.c_str());
+  }
+  static uintptr_t apiFind(const char* c, const char* n, const char* o) {
+      uintptr_t r = findObject(c, n, o);
+      if (!r) miss(std::string("object ") + (c ? c : "?") + " " + (n ? n : "?") + " in " + (o ? o : "?"));
+      return r;
+  }
   static int apiIsA(uintptr_t c, uintptr_t t) { return isA(c, t); }
-  static uintptr_t apiField(uintptr_t c, const char* n) { return fieldOf(c, n); }
-  static int apiFieldOffset(uintptr_t c, const char* n) { uintptr_t f = fieldOf(c, n); return f ? get<int>(f + fOffset, -1) : -1; }
+  static uintptr_t apiFieldMiss(uintptr_t c, const char* n) {
+      uintptr_t f = fieldOf(c, n);
+      if (!f && c) miss(std::string("field ") + (n ? n : "?") + " on " + objName(c));
+      return f;
+  }
+  static uintptr_t apiField(uintptr_t c, const char* n) { return apiFieldMiss(c, n); }
+  static int apiFieldOffset(uintptr_t c, const char* n) { uintptr_t f = apiFieldMiss(c, n); return f ? get<int>(f + fOffset, -1) : -1; }
 
   // Declare a value for a key in one of the loader's ini files. The file's
   // own value wins over a default (the user edits these by hand), and the
@@ -840,11 +1080,37 @@ static int apiPatch(uintptr_t addr, const void* bytes, int len) {
   }
 static int apiRun(MtGameThreadFn fn, void* ctx) {
     if (!fn) return 0;
+    // The game is closing: nothing is queued any more.
+    if (InterlockedCompareExchange(&g_stopping, 0, 0)) return 0;
     EnterCriticalSection(&g_queueLock); g_queue.emplace_back(fn, ctx); LeaveCriticalSection(&g_queueLock);
     InterlockedExchange(&g_queued, 1);
     return 1;
 }
-static void apiPE(uintptr_t obj, uintptr_t func, void* parms) { if (g_pe) g_pe(obj, func, parms, 0); }
+// A null function is a plugin's mistake -- a name that has not loaded -- and calling into it took the game down
+// (2026-11-16: the helicopter plugin called one that was missing and the game crashed in ProcessEvent).
+// A plugin's call into the engine, guarded. The engine dereferences the object it is called on,
+// and an object the game has destroyed (a vehicle the player just left, a water subsystem from a
+// world that is gone) is a null read inside the engine -- the crash of 2026-11-18, in the wave
+// clock's read, 39 s into a session: the game's own code faulted with no plugin frame on the stack,
+// because the plugin's call was what led there. The fault is caught here, so the plugin carries on
+// (the parameters stay as they were) and the game keeps running.
+//
+// The game's OWN calls are not guarded: they go through the hook, which calls the engine directly.
+static volatile LONG pluginCallFaulted = 0;
+static void apiPE(uintptr_t obj, uintptr_t func, void* parms) {
+    // The game is on its way out: nothing of a plugin's touches the engine any more (2026-11-17:
+    // the game hung on "stopping" -- a plugin's tick ran inside the teardown and waited for a lock
+    // one of its own threads held while it was inside the engine).
+    if (InterlockedCompareExchange(&g_stopping, 0, 0)) return;
+    if (!g_pe || !func) return;
+    __try {
+        g_pe(obj, func, parms, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // The engine faulted on an object that was already gone. Say so once, so the log names it.
+        if (!InterlockedExchange(&pluginCallFaulted, 1))
+            logf("a plugin's engine call faulted (the object was gone): obj %p func %p -- the call is skipped", (void*)obj, (void*)func);
+    }
+}
 static int apiHooked() { return g_pe != nullptr; }
 
 static int apiWatch(const char* const* names, int count, MtPeHookFn fn, void* ctx) {
@@ -912,11 +1178,54 @@ static DWORD WINAPI loadPlugins(LPVOID) {
         if (_wcsnicmp(who.c_str(), L"mt_plugin_", 10) == 0) who = who.substr(10);
         p->log = logsOn() && pluginLogs(who) ? _wfopen(logFile(who).c_str(), L"w") : nullptr;
         p->api = { MT_API_VERSION, sizeof(MtApi), apiLog, apiWait, &g_layout, apiRead, apiWrite, apiName, apiFname,
-                     apiNum, apiObject, apiFind, apiIsA, apiField, apiFieldOffset, apiRun, apiPE, apiHooked, p, apiWatch, apiNameIndex, apiPatch, apiModuleBase, apiIniSet, apiIniGet, apiPoolNames };
+                     apiNum, apiObject, apiFind, apiIsA, apiField, apiFieldOffset, apiRun, apiPE, apiHooked, p, apiWatch, apiNameIndex, apiPatch, apiModuleBase, apiIniSet, apiIniGet, apiPoolNames, apiKeep, apiStopping };
         int rc = init(&p->api);
         logf("plugin %s: PluginInit -> %d", nm.c_str(), rc);
     }
     return 0;
+}
+
+// ECVF_Cheat unlock ([CVars] UnlockCheat=1 in mt_loader.ini, on by default). A shipping build will not set a cheat
+// console variable from the console, an ini or UserEngine.ini [ConsoleVariables]; most mh.* economy and limit variables
+// are cheat ones. Learnt from Balledk's "CVar INI Unlocker" (winhttp.dll, v1.6, 2026-11-13): two one-byte patches in the
+// exe's code, made in DllMain -- before the engine's static variables register, which a plugin thread would race:
+//   registration (AddConsoleObject): GetFlags(); test al,1 (ECVF_Cheat); jnz ...  -> test al,0
+//   setting (OnCVarChange):          mov esi,eax; and sil,1; cmp edi,01000000h   -> and sil,0
+// Each pattern must match exactly once, or nothing is written. Already 0 (his dll ran first): not found, harmless.
+// The 0.7.20 builds since 11-12 compile the setter's GetFlags() call as `call rdx`, not `call [rdx+18h]`, which is why
+// the pattern starts after the call (his v1.6 misses that one).
+static void unlockCheatCvars() {
+    if (iniInt(L"CVars", L"UnlockCheat", 1) == 0) { logf("cvars: cheat variables left locked ([CVars] UnlockCheat=0)"); return; }
+    auto exe = (uint8_t*)GetModuleHandleW(nullptr);
+    auto nt = (IMAGE_NT_HEADERS*)(exe + ((IMAGE_DOS_HEADER*)exe)->e_lfanew);
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    uint8_t* text = nullptr; size_t size = 0;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++)
+        if (!memcmp(sec[i].Name, ".text", 6)) { text = exe + sec[i].VirtualAddress; size = sec[i].Misc.VirtualSize; }
+    if (!text) { logf("cvars: no .text section -- cheat variables left locked"); return; }
+    struct Site { const char* what; uint8_t pat[16]; int len, at; } sites[] = {
+        {"registration", {0x40, 0x32, 0xFF, 0x48, 0x8B, 0x06, 0x48, 0x8B, 0xCE, 0xFF, 0x50, 0x18, 0xA8, 0x01, 0x75}, 15, 13},
+        {"setting", {0x8B, 0xF0, 0x40, 0x80, 0xE6, 0x01, 0x81, 0xFF, 0x00, 0x00, 0x00, 0x01, 0x75}, 13, 5},
+    };
+    for (auto& st : sites) {
+        uint8_t* hit = nullptr; int n = 0, done = 0;
+        uint8_t unlocked[16];
+        memcpy(unlocked, st.pat, st.len); unlocked[st.at] = 0;
+        for (size_t i = 0; i + st.len <= size; i++) {
+            if (text[i] != st.pat[0]) continue;
+            if (!memcmp(text + i, st.pat, st.len)) { hit = text + i; n++; }
+            else if (!memcmp(text + i, unlocked, st.len)) done++;
+        }
+        // Balledk's winhttp.dll does the same patches; whichever dll loads first makes them, the other finds them made.
+        if (n == 0 && done == 1) { logf("cvars: %s check already unlocked (another mod, e.g. CVar INI Unlocker)", st.what); continue; }
+        if (n != 1) { logf("cvars: %s check found %d times (%d already unlocked) -- left as it is", st.what, n, done); continue; }
+        DWORD old;
+        if (!VirtualProtect(hit + st.at, 1, PAGE_EXECUTE_READWRITE, &old)) { logf("cvars: %s check not writable", st.what); continue; }
+        hit[st.at] = 0;
+        VirtualProtect(hit + st.at, 1, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), hit + st.at, 1);
+        logf("cvars: %s check unlocked at exe+%llx", st.what, (unsigned long long)(hit + st.at - exe));
+    }
 }
 
 BOOL APIENTRY DllMain(HMODULE h, DWORD why, LPVOID) {
@@ -935,9 +1244,11 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD why, LPVOID) {
         // set different keys of the same file cannot overwrite each other.
         g_ini.init(exeDir(), iniLog);
         logf("Motor Town plugin loader, api v%d", MT_API_VERSION);
+        unlockCheatCvars();  // before any thread: the engine registers its console variables as it starts
         // Both run once DllMain returns and the loader lock is free.
         CloseHandle(CreateThread(nullptr, 0, discover, nullptr, 0, nullptr));
         CloseHandle(CreateThread(nullptr, 0, loadPlugins, nullptr, 0, nullptr));
+        CloseHandle(CreateThread(nullptr, 0, watchWorld, nullptr, 0, nullptr));
     }
     return TRUE;
 }

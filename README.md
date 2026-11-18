@@ -1,19 +1,62 @@
-<p align="center">
-  <img src=".github/hero.png" alt="Plugin Loader" width="100%">
-</p>
-
 # Plugin Loader
 
-Plugin loader for Motor Town.
+![Plugin Loader](media/cover.svg)
+
+**The loader every Motor Town plugin runs on. Install it once, then drop any plugin into the plugins folder beside it: plugins load in alphabetical order and never overwrite each other's settings.**
+
+Motor Town has no built-in support for code mods. The Plugin Loader adds it: a single version.dll that the game loads on its own at startup, and that then loads every plugin you put in the plugins folder next to it. On its own it changes nothing you can see. It is what lets the plugins run.
+
+### What you get
+
+- One install for every plugin. Each plugin is a single file, plugins\mt_plugin_<Name>.dll, and the loader picks it up the next time you start the game.
+- Plugins load in alphabetical order, the same order every time. Anything else in the plugins folder is ignored.
+- One shared hook into the game, owned by the loader. Plugins go through it instead of each patching the game on their own, which is what lets several plugins run side by side without breaking each other.
+- Settings that stay yours. Each plugin keeps its settings in plugins\<plugin>.ini, created on first launch. When two plugins share a settings file, each one only ever writes its own keys, and a value you typed by hand always wins over a plugin's default.
+
+### Install
+
+1. In Steam, right-click Motor Town > Manage > Browse local files.
+2. Drag the MotorTown folder from this download into that window and let it merge.
+3. Add the plugins you want the same way.
+
+To remove it, delete MotorTown\Binaries\Win64\version.dll. To turn off one plugin, set Disabled=1 under [General] in its .ini file, or delete its .dll.
+
+### Settings
+
+The loader's own settings are in MotorTown\Binaries\Win64\mt_loader.ini, created on first launch.
+
+- Logging=1 under [General] writes a log for the loader and every plugin, under plugins\logs. Logging is off by default, and then no log files are created.
+- UnlockCheat under [CVars] is on by default. It lets the game take console variables that are normally locked to developers from your own ini files, which is what server and economy settings use. Set it to 0 to leave them locked.
+
+### Linux and Steam Deck
+
+Proton uses its own version.dll unless told otherwise. Add this to the game's Steam launch options:
+
+```
+WINEDLLOVERRIDES="version=n,b" %command%
+```
+
+### Antivirus warnings
+
+Some scanners flag version.dll. It sits in the game folder under a Windows file's name and changes the running game, which is what a loader has to do and what a scanner is wary of. The loader makes no network connections, downloads nothing and runs no programs, and its full source is public. If yours flags it, exclude only the game's Binaries\Win64 folder. Do not turn your antivirus off.
+
+### For mod makers
+
+A plugin is a .dll that exports one function, PluginInit. It gets a versioned set of functions for reading the game, calling into it on the game thread, watching game functions, and reading and writing settings, documented in [include/mt_plugin_api.h](include/mt_plugin_api.h) and below. After a game update, Export=1 under [Mappings] in mt_loader.ini writes a fresh mappings file the next time you load a save.
+
+---
+
+## For plugin authors
 
 Only one file can be `version.dll`, so this is it, and every native mod is a
 plugin of it.
 
 ```
 MotorTown\Binaries\Win64\version.dll                         the loader
-MotorTown\Binaries\Win64\mt_loader.log / mt_loader.ini       its log, [Mappings] Export=1
+MotorTown\Binaries\Win64\mt_loader.ini                       its settings: [General] Logging, [Mappings] Export, [CVars] UnlockCheat
 MotorTown\Binaries\Win64\plugins\mt_plugin_<Name>.dll        a plugin
-MotorTown\Binaries\Win64\plugins\mt_plugin_<Name>.log        its log
+MotorTown\Binaries\Win64\plugins\<plugin>.ini                its settings, created on first launch
+MotorTown\Binaries\Win64\plugins\logs\<Name>\<start>.log     a log, only with [General] Logging=1
 ```
 
 Build: `build.bat` (MSVC 2022) -> `out\`. Proton: `WINEDLLOVERRIDES="version=n,b" %command%`.
@@ -24,26 +67,6 @@ Build: `build.bat` (MSVC 2022) -> `out\`. Proton: `WINEDLLOVERRIDES="version=n,b
   that opens a panel) waits for a world that may never arrive. The loader's
   log says `ProcessEvent: vtable index N, M slots hooked`; if that line is
   missing, nothing that touches the game thread runs.
-
-## Linux and Steam Deck
-
-Proton loads its own `version.dll` unless told otherwise. Add this to the game's Steam launch
-options:
-
-    WINEDLLOVERRIDES="version=n,b" %command%
-
-## Antivirus warnings
-
-Windows Defender and a few other scanners can flag `version.dll`. VirusTotal showed 3 of 60 for
-one build (ClamAV `Win.Backdoor.Sagerunex`, Microsoft `Trojan:Win32/Wacatac.C!ml`, Cynet). The
-`!ml` means a machine learning guess, not a known virus. The loader has to look suspicious to a
-scanner: it sits in the game folder under a Windows dll's name, and it patches the running game.
-It makes no network connections, downloads nothing and runs no commands, and the source is here
-to read and build yourself.
-
-If yours flags it, get the dll from this repo's releases, compare its SHA-256 with the one
-published there, and exclude only the game's `Binaries\Win64` folder. Do not turn Windows
-Security off.
 
 ## Rules
 
@@ -62,7 +85,7 @@ Security off.
 - The api is a versioned struct of function pointers; fields are only appended,
   so a plugin built against v1 keeps working on later loaders.
 
-## The api (v6)
+## The api (v8)
 
 `include/mt_plugin_api.h` is the whole contract. What a plugin gets:
 
@@ -74,6 +97,9 @@ Security off.
 | **watching** | `watch_functions(names, count, fn, ctx)` -- called back on the game thread when one of those UFunctions fires; `fn` may read **or edit** the parameter block in place, and returning non-zero blocks the original call |
 | **patching** | `patch_bytes(addr, bytes, len)` -- overwrite game code (writable for the write, protection restored, instruction cache flushed) |
 | **ini files** | `ini_set(self, file, section, key, value, force)` -- declare a value in one of the loader's ini files; `ini_get(file, section, key, buf, cap)` -- read the merged value back |
+| names (v6) | `pool_names(fn, ctx)` -- walk every name the engine registered (console variables are registered by name) |
+| keeping (v7) | `keep(obj)` -- keep an object for the session (AddToRoot), for assets a plugin loads and hands to the engine; since v7 `object()` returns 0 for an object the game destroyed but has not collected |
+| closing (v8) | `stopping()` -- 1 once the loader decides the game is closing (the world is gone and none came back); a plugin's own threads end on it. While it is 1 the loader runs no plugin work. Not yet seen firing at a real exit: do not rely on it to save state |
 
 Two things a plugin author needs to know, both learned the hard way:
 

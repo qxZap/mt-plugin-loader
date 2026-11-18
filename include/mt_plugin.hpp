@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cwctype>
 #include <set>
 #include <string>
 #include <vector>
@@ -27,6 +28,25 @@ inline const MtLayout& L() { return *api->layout; }
 inline uintptr_t classOf(uintptr_t o) { return get<uintptr_t>(o + L().obj_class); }
 inline uintptr_t outerOf(uintptr_t o) { return get<uintptr_t>(o + L().obj_outer); }
 inline uintptr_t superOf(uintptr_t c) { return get<uintptr_t>(c + L().struct_super); }
+// SEH filter for a plugin's guarded tick: catch a fault only when it happened in this plugin's own code. A fault inside
+// the engine (a ProcessEvent on a dead object) must not be swallowed: unwinding skips the engine's cleanup and the game
+// carries on half-way through an operation, to crash later with no trace (2026-11-12: Suspension Tuning 22:04:15 ->
+// the game at 22:05). Let it crash where it happens, with a real stack.
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+inline int ownFaultOnly(unsigned code, EXCEPTION_POINTERS* ep) {
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_IN_PAGE_ERROR && code != EXCEPTION_DATATYPE_MISALIGNMENT) return EXCEPTION_CONTINUE_SEARCH;
+    HMODULE m = nullptr;
+    if (ep && ep->ExceptionRecord)
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ep->ExceptionRecord->ExceptionAddress, &m);
+    return m == (HMODULE)&__ImageBase ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+
+// A loaded asset kept for the session (loader v7 keep(): AddToRoot), so a GC never frees it under the components using
+// it. Older loaders: nothing done. Returns o.
+inline uintptr_t rooted(uintptr_t o) {
+    if (o && api->size >= offsetof(MtApi, keep) + sizeof(void*) && api->keep) api->keep(o);
+    return o;
+}
 inline bool isCDO(uintptr_t o) { return (get<uint32_t>(o + L().obj_flags) & 0x10) != 0; }  // RF_ClassDefaultObject
 inline std::string objName(uintptr_t o) { return name(get<uint32_t>(o + L().obj_name)); }
 inline int off(uintptr_t cls, const char* n) { return api->field_offset(cls, n); }
@@ -181,4 +201,27 @@ inline int iniInt(const wchar_t* file, const wchar_t* section, const wchar_t* ke
 // [General] Disabled=1 in a plugin's own file: it starts nothing, so the game runs as if it
 // were not installed. Asked before PluginInit starts the plugin's thread.
 inline bool iniDisabled(const wchar_t* file) { return iniInt(file, L"General", L"Disabled", 0) != 0; }
+
+// Is this vehicle a boat? By its class name against the Boats plugin's own list (boats.ini [Boats] Vehicles,
+// "|"-separated, read once), so every plugin agrees with it. Tuning plugins keep their hands off boats (the user,
+// 2026-11-13: no wheel size, ECU or suspension tuning on a boat; licence plates may stay).
+// shortcut: by name only, not the vehicle row's "Boat" tag the Boats plugin also reads; name a new boat to match the list.
+inline bool isBoatVehicle(uintptr_t v) {
+    static const std::vector<std::string> words = [] {
+        std::wstring w = iniGet(L"boats.ini", L"Boats", L"Vehicles");
+        if (w.empty()) w = L"tugboat|ferry|boat_|ship_|containership";
+        std::vector<std::string> out;
+        std::string cur;
+        for (wchar_t c : w + L"|") {
+            if (c == L'|') { if (!cur.empty()) out.push_back(cur); cur.clear(); }
+            else cur += (char)towlower(c);
+        }
+        return out;
+    }();
+    if (!v) return false;
+    std::string n = objName(classOf(v));
+    for (auto& c : n) c = (char)tolower((unsigned char)c);
+    for (auto& w : words) if (n.find(w) != std::string::npos) return true;
+    return false;
+}
 }  // namespace mt
